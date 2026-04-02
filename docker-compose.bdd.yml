@@ -1,0 +1,33 @@
+services:
+  zeroclaw-app:
+    build:
+      context: .
+      target: dev # Using dev stage for flexibility
+    environment:
+      - ZEROCLAW_DEFAULT_PROVIDER=gemini
+      - ZEROCLAW_API_URL=http://gemini-mock:3000
+      - GEMINI_API_KEY=mock-key
+      - ZEROCLAW_MODEL=gemini-1.5-pro
+      - ZEROCLAW_GATEWAY_PORT=42617
+      - ZEROCLAW_GATEWAY_HOST=0.0.0.0
+    ports:
+      - "42617:42617"
+    depends_on:
+      - gemini-mock
+
+  gemini-mock:
+    build:
+      context: .
+      dockerfile: Dockerfile.bdd
+    command: cargo run --bin mock_gemini
+    ports:
+      - "3000:3000"
+
+  bdd-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.bdd
+    command: cargo test --test bdd -- --nocapture
+    depends_on:
+      - zeroclaw-app
+      - gemini-mock
