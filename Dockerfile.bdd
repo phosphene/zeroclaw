@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.94-slim AS bdd-base
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+# Dummy project to cache dependencies
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY apps/ apps/
+RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
+RUN mkdir -p tests/bdd && echo "fn main() {}" > tests/bdd/main.rs && echo "fn main() {}" > tests/bdd/mock_gemini.rs
+RUN cargo build --locked --tests --bins --all-features
+
+# Copy real source
+COPY src/ src/
+COPY tests/ tests/
+RUN touch src/main.rs tests/bdd/main.rs tests/bdd/mock_gemini.rs
+RUN cargo build --locked --test bdd --bin mock_gemini
