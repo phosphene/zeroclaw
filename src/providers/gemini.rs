@@ -5,7 +5,10 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, StreamChunk, TokenUsage};
+use crate::providers::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities, StreamChunk,
+    StreamError, StreamEvent, StreamOptions, StreamResult, TokenUsage, ToolsPayload,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -24,6 +27,8 @@ pub struct GeminiProvider {
     auth_service: Option<AuthService>,
     /// Override profile name for managed auth.
     auth_profile_override: Option<String>,
+    /// Base URL for API requests (internal/testing).
+    base_url: Option<String>,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -523,6 +528,7 @@ impl GeminiProvider {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            base_url: None,
         }
     }
 
@@ -596,6 +602,7 @@ impl GeminiProvider {
                 None
             },
             auth_profile_override: profile_override,
+            base_url: None,
         }
     }
 
@@ -840,31 +847,23 @@ impl GeminiProvider {
         model.strip_prefix("models/").unwrap_or(model).to_string()
     }
 
-    /// Build the API URL based on auth type.
-    ///
-    /// - API key users → public `generativelanguage.googleapis.com/v1beta`
-    /// - OAuth users → internal `cloudcode-pa.googleapis.com/v1internal`
-    ///
-    /// The Gemini CLI OAuth tokens are scoped for the internal Code Assist API,
-    /// not the public API. Sending them to the public endpoint results in
-    /// "400 Bad Request: API key not valid" errors.
-    /// See: https://github.com/google-gemini/gemini-cli/issues/19200
-    fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
-        match auth {
+    fn build_generate_content_url(&self, model: &str, auth: &GeminiAuth) -> String {
+        let (base, is_internal) = match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
-                // OAuth tokens are scoped for the internal Code Assist API.
-                // The model is passed in the request body, not the URL path.
-                format!("{CLOUDCODE_PA_ENDPOINT}:generateContent")
+                (self.base_url.as_deref().unwrap_or(CLOUDCODE_PA_ENDPOINT), true)
             }
-            _ => {
-                let model_name = Self::format_model_name(model);
-                let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
+            _ => (self.base_url.as_deref().unwrap_or(PUBLIC_API_ENDPOINT), false),
+        };
 
-                if auth.is_api_key() {
-                    format!("{base_url}?key={}", auth.api_key_credential())
-                } else {
-                    base_url
-                }
+        if is_internal {
+            format!("{}:generateContent", base)
+        } else {
+            let model_name = Self::format_model_name(model);
+            let url = format!("{}/{}:generateContent", base, model_name);
+            if auth.is_api_key() {
+                format!("{}?key={}", url, auth.api_key_credential())
+            } else {
+                url
             }
         }
     }
@@ -1078,7 +1077,7 @@ impl GeminiProvider {
             tools,
         };
 
-        let url = Self::build_generate_content_url(model, auth);
+        let url = self.build_generate_content_url(model, auth);
 
         let mut response = self
             .build_generate_content_request(
@@ -1227,13 +1226,209 @@ impl GeminiProvider {
             reasoning_content,
         })
     }
+    async fn stream_generate_content(
+        &self,
+        contents: Vec<Content>,
+        system_instruction: Option<Content>,
+        tools: Option<Vec<GeminiTool>>,
+        model: &str,
+        temperature: f64,
+    ) -> crate::providers::traits::StreamResult<
+        futures_util::stream::BoxStream<'static, crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>>,
+    > {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            crate::providers::traits::StreamError::Provider("Gemini API key not found".to_string())
+        })?;
+
+        // For OAuth: get a valid (potentially refreshed) token and resolve project
+        let (oauth_token, project) = match auth {
+            GeminiAuth::OAuthToken(state) => {
+                let token = Self::get_valid_oauth_token(state).await.map_err(|e| {
+                    crate::providers::traits::StreamError::Provider(format!(
+                        "OAuth token error: {e}"
+                    ))
+                })?;
+                let proj = self.resolve_oauth_project(&token).await.map_err(|e| {
+                    crate::providers::traits::StreamError::Provider(format!(
+                        "OAuth project error: {e}"
+                    ))
+                })?;
+                (Some(token), Some(proj))
+            }
+            GeminiAuth::ManagedOAuth => {
+                let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+                    crate::providers::traits::StreamError::Provider(
+                        "ManagedOAuth requires auth_service".to_string(),
+                    )
+                })?;
+                let token = auth_service
+                    .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
+                    .await
+                    .map_err(|e| {
+                        crate::providers::traits::StreamError::Provider(format!(
+                            "ManagedOAuth error: {e}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        crate::providers::traits::StreamError::Provider(
+                            "Gemini auth profile not found".to_string(),
+                        )
+                    })?;
+                let proj = self.resolve_oauth_project(&token).await.map_err(|e| {
+                    crate::providers::traits::StreamError::Provider(format!(
+                        "OAuth project error: {e}"
+                    ))
+                })?;
+                (Some(token), Some(proj))
+            }
+            _ => (None, None),
+        };
+
+        let request = GenerateContentRequest {
+            contents,
+            system_instruction,
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: 8192,
+            },
+            tools,
+        };
+
+        let base_url = self.build_generate_content_url(model, auth);
+        let stream_url = format!(
+            "{}?alt=sse",
+            base_url.replace(":generateContent", ":streamGenerateContent")
+        );
+
+        let response = self
+            .build_generate_content_request(
+                auth,
+                &stream_url,
+                &request,
+                model,
+                true,
+                project.as_deref(),
+                oauth_token.as_deref(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                crate::providers::traits::StreamError::Provider(format!("Streaming error: {e}"))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(crate::providers::traits::StreamError::Provider(format!(
+                "Gemini streaming API error ({status}): {error_text}"
+            )));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        tokio::spawn(async move {
+            Self::parse_gemini_stream(response, tx).await;
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    async fn parse_gemini_stream(
+        response: reqwest::Response,
+        tx: tokio::sync::mpsc::Sender<crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>>,
+    ) {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncBufReadExt;
+        use tokio_util::io::StreamReader;
+
+        let byte_stream = response
+            .bytes_stream()
+            .map(|result| result.map_err(std::io::Error::other));
+        let reader = StreamReader::new(byte_stream);
+        let mut lines = reader.lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let json_str = &line["data: ".len()..];
+            let result: Result<GenerateContentResponse, _> = serde_json::from_str(json_str);
+
+            match result {
+                Ok(resp) => {
+                    let mut text_parts = Vec::new();
+                    let mut tool_calls = Vec::new();
+
+                    if let Some(candidate) = resp.candidates.and_then(|c| c.into_iter().next()) {
+                        if let Some(content) = candidate.content {
+                            for part in content.parts {
+                                if part.thought {
+                                    // Handle thought parts if needed
+                                } else if let Some(fc) = part.function_call {
+                                    tool_calls.push(crate::providers::traits::ToolCall {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        name: fc.name,
+                                        arguments: fc.args.to_string(),
+                                    });
+                                } else if let Some(t) = part.text {
+                                    text_parts.push(t);
+                                }
+                            }
+                        }
+                    }
+
+                    for text in text_parts {
+                        if !text.is_empty() {
+                            let _ = tx
+                                .send(Ok(StreamEvent::TextDelta(
+                                    StreamChunk::delta(text),
+                                )))
+                                .await;
+                        }
+                    }
+
+                    for call in tool_calls {
+                        let _ = tx
+                            .send(Ok(StreamEvent::ToolCall(call)))
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "JSON decode error: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        let _ = tx.send(Ok(crate::providers::traits::StreamEvent::Final)).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_base_url(&mut self, url: String) {
+        self.base_url = Some(url);
+    }
 }
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+            prompt_caching: false,
+        }
+    }
 
-    fn convert_tools(&self, tools: &[crate::tools::ToolSpec]) -> crate::providers::traits::ToolsPayload {
-        crate::providers::traits::ToolsPayload::Gemini {
+    fn convert_tools(&self, tools: &[crate::tools::ToolSpec]) -> ToolsPayload {
+        ToolsPayload::Gemini {
             function_declarations: tools
                 .iter()
                 .map(|t| {
@@ -1346,8 +1541,8 @@ impl Provider for GeminiProvider {
         message: &str,
         model: &str,
         temperature: f64,
-        _options: crate::providers::traits::StreamOptions,
-    ) -> futures_util::stream::BoxStream<'static, crate::providers::traits::StreamResult<crate::providers::traits::StreamChunk>> {
+        _options: StreamOptions,
+    ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
             parts: vec![Part::text(sys)],
@@ -1378,11 +1573,11 @@ impl Provider for GeminiProvider {
 
     fn stream_chat(
         &self,
-        request: crate::providers::traits::ChatRequest<'_>,
+        request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
-        _options: crate::providers::traits::StreamOptions,
-    ) -> futures_util::stream::BoxStream<'static, crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>> {
+        _options: StreamOptions,
+    ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let mut system_parts: Vec<&str> = Vec::new();
         let mut contents: Vec<Content> = Vec::new();
 
@@ -1434,8 +1629,6 @@ impl Provider for GeminiProvider {
         if let Some(auth) = self.auth.as_ref() {
             match auth {
                 GeminiAuth::ManagedOAuth => {
-                    // For ManagedOAuth, verify and refresh the token if needed.
-                    // This ensures fallback works even if tokens expired during daemon uptime.
                     let auth_service = self
                         .auth_service
                         .as_ref()
@@ -1449,24 +1642,19 @@ impl Provider for GeminiProvider {
                                 "Gemini auth profile not found or expired. Run: zeroclaw auth login --provider gemini"
                             )
                         })?;
-
-                    // Token refresh happens in get_valid_gemini_access_token().
-                    // We don't call resolve_oauth_project() here to keep warmup fast.
-                    // OAuth project will be resolved lazily on first real request.
                 }
                 GeminiAuth::OAuthToken(_) => {
-                    // CLI OAuth — cloudcode-pa does not expose a lightweight model-list probe.
-                    // Token will be validated on first real request.
                 }
                 _ => {
-                    // API key path — verify with public API models endpoint.
+                    let base = self.base_url.as_deref().unwrap_or(PUBLIC_API_ENDPOINT);
                     let url = if auth.is_api_key() {
                         format!(
-                            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                            "{}/models?key={}",
+                            base,
                             auth.api_key_credential()
                         )
                     } else {
-                        "https://generativelanguage.googleapis.com/v1beta/models".to_string()
+                        format!("{}/models", base)
                     };
 
                     self.http_client()
@@ -1479,198 +1667,18 @@ impl Provider for GeminiProvider {
         }
         Ok(())
     }
-
-
-    async fn stream_generate_content(
-        &self,
-        contents: Vec<Content>,
-        system_instruction: Option<Content>,
-        tools: Option<Vec<GeminiTool>>,
-        model: &str,
-        temperature: f64,
-    ) -> crate::providers::traits::StreamResult<
-        futures_util::stream::BoxStream<'static, crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>>,
-    > {
-        let auth = self.auth.as_ref().ok_or_else(|| {
-            crate::providers::traits::StreamError::Provider("Gemini API key not found".to_string())
-        })?;
-
-        // For OAuth: get a valid (potentially refreshed) token and resolve project
-        let (oauth_token, project) = match auth {
-            GeminiAuth::OAuthToken(state) => {
-                let token = Self::get_valid_oauth_token(state).await.map_err(|e| {
-                    crate::providers::traits::StreamError::Provider(format!(
-                        "OAuth token error: {e}"
-                    ))
-                })?;
-                let proj = self.resolve_oauth_project(&token).await.map_err(|e| {
-                    crate::providers::traits::StreamError::Provider(format!(
-                        "OAuth project error: {e}"
-                    ))
-                })?;
-                (Some(token), Some(proj))
-            }
-            GeminiAuth::ManagedOAuth => {
-                let auth_service = self.auth_service.as_ref().ok_or_else(|| {
-                    crate::providers::traits::StreamError::Provider(
-                        "ManagedOAuth requires auth_service".to_string(),
-                    )
-                })?;
-                let token = auth_service
-                    .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
-                    .await
-                    .map_err(|e| {
-                        crate::providers::traits::StreamError::Provider(format!(
-                            "ManagedOAuth error: {e}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        crate::providers::traits::StreamError::Provider(
-                            "Gemini auth profile not found".to_string(),
-                        )
-                    })?;
-                let proj = self.resolve_oauth_project(&token).await.map_err(|e| {
-                    crate::providers::traits::StreamError::Provider(format!(
-                        "OAuth project error: {e}"
-                    ))
-                })?;
-                (Some(token), Some(proj))
-            }
-            _ => (None, None),
-        };
-
-        let request = GenerateContentRequest {
-            contents,
-            system_instruction,
-            generation_config: GenerationConfig {
-                temperature,
-                max_output_tokens: 8192,
-            },
-            tools,
-        };
-
-        let base_url = Self::build_generate_content_url(model, auth);
-        let stream_url = format!("{}?alt=sse", base_url.replace(":generateContent", ":streamGenerateContent"));
-
-        let response = self
-            .build_generate_content_request(
-                auth,
-                &stream_url,
-                &request,
-                model,
-                true,
-                project.as_deref(),
-                oauth_token.as_deref(),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                crate::providers::traits::StreamError::Provider(format!("Streaming error: {e}"))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(crate::providers::traits::StreamError::Provider(format!(
-                "Gemini streaming API error ({status}): {error_text}"
-            )));
-        }
-
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-        tokio::spawn(async move {
-            Self::parse_gemini_stream(response, tx).await;
-        });
-
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
-    }
-
-    async fn parse_gemini_stream(
-        response: reqwest::Response,
-        tx: tokio::sync::mpsc::Sender<crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>>,
-    ) {
-        use futures_util::StreamExt;
-        use tokio::io::AsyncBufReadExt;
-        use tokio_util::io::StreamReader;
-
-        let byte_stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
-        let reader = StreamReader::new(byte_stream);
-        let mut lines = reader.lines();
-
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if !line.starts_with("data: ") {
-                continue;
-            }
-            let json_str = &line["data: ".len()..];
-            let result: Result<GenerateContentResponse, _> = serde_json::from_str(json_str);
-
-            match result {
-                Ok(resp) => {
-                    let mut text_parts = Vec::new();
-                    let mut tool_calls = Vec::new();
-
-                    if let Some(candidate) = resp.candidates.and_then(|c| c.into_iter().next()) {
-                        if let Some(content) = candidate.content {
-                            for part in content.parts {
-                                if part.thought {
-                                    // Handle thought parts if needed, currently we just skip or send as delta if desired.
-                                    // For now, reasoning is usually sent in unary or khusus thinking chunks.
-                                } else if let Some(fc) = part.function_call {
-                                    tool_calls.push(crate::providers::traits::ToolCall {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        name: fc.name,
-                                        arguments: fc.args.to_string(),
-                                    });
-                                } else if let Some(t) = part.text {
-                                    text_parts.push(t);
-                                }
-                            }
-                        }
-                    }
-
-                    for text in text_parts {
-                        if !text.is_empty() {
-                            let _ = tx
-                                .send(Ok(crate::providers::traits::StreamEvent::TextDelta(
-                                    crate::providers::traits::StreamChunk::delta(text),
-                                )))
-                                .await;
-                        }
-                    }
-
-                    for call in tool_calls {
-                        let _ = tx
-                            .send(Ok(crate::providers::traits::StreamEvent::ToolCall(call)))
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(crate::providers::traits::StreamError::Provider(format!(
-                            "JSON decode error: {e}"
-                        ))))
-                        .await;
-                    return;
-                }
-            }
-        }
-
-        let _ = tx.send(Ok(crate::providers::traits::StreamEvent::Final)).await;
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::{StatusCode, header::AUTHORIZATION};
-    use crate::providers::traits::{ToolsPayload, StreamEvent, ChatResponse, StreamChunk};
+    use crate::providers::traits::{ToolsPayload, StreamEvent, ChatMessage};
     use crate::tools::ToolSpec;
+    use axum::{Json, Router, routing::post};
+    use futures_util::StreamExt;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
 
     /// Helper to create a test OAuth auth variant.
     fn test_oauth_auth(token: &str) -> GeminiAuth {
@@ -1691,6 +1699,7 @@ mod tests {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            base_url: None,
         }
     }
 
@@ -1855,14 +1864,16 @@ mod tests {
     #[test]
     fn api_key_url_includes_key_query_param() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let provider = test_provider(None);
+        let url = provider.build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.contains(":generateContent?key=api-key-123"));
     }
 
     #[test]
     fn oauth_url_uses_internal_endpoint() {
         let auth = test_oauth_auth("ya29.test-token");
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let provider = test_provider(None);
+        let url = provider.build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.starts_with("https://cloudcode-pa.googleapis.com/v1internal"));
         assert!(url.ends_with(":generateContent"));
         assert!(!url.contains("generativelanguage.googleapis.com"));
@@ -1872,7 +1883,8 @@ mod tests {
     #[test]
     fn api_key_url_uses_public_endpoint() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let provider = test_provider(None);
+        let url = provider.build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.contains("generativelanguage.googleapis.com/v1beta"));
         assert!(url.contains("models/gemini-2.0-flash"));
     }
@@ -1881,7 +1893,7 @@ mod tests {
     fn oauth_request_uses_bearer_auth_header() {
         let provider = test_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = provider.build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1920,7 +1932,7 @@ mod tests {
     fn oauth_request_wraps_payload_in_request_envelope() {
         let provider = test_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = provider.build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1962,7 +1974,7 @@ mod tests {
     fn api_key_request_does_not_set_bearer_header() {
         let provider = test_provider(Some(GeminiAuth::ExplicitKey("api-key-123".into())));
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = provider.build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -2420,6 +2432,159 @@ mod tests {
     }
 
     #[test]
+    fn test_map_messages_with_images() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Check this image: [IMAGE:data:image/jpeg;base64,/9j/4AAQ] What do you see?".to_string(),
+        }];
+
+        let provider = test_provider(None);
+        let contents = provider.map_messages(&messages);
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].parts.len(), 3);
+        
+        // Part 1: text before image
+        assert!(contents[0].parts[0].text.as_ref().unwrap().contains("Check this image:"));
+        
+        // Part 2: image
+        let image_part = &contents[0].parts[1].inline_data.as_ref().unwrap();
+        assert_eq!(image_part.mime_type, "image/jpeg");
+        assert_eq!(image_part.data, "/9j/4AAQ");
+        
+        // Part 3: text after image
+        assert!(contents[0].parts[2].text.as_ref().unwrap().contains("What do you see?"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_integration() {
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/models/gemini-2.0-flash:generateContent",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{
+                                    "functionCall": {
+                                        "name": "get_weather",
+                                        "args": {"location": "San Francisco"}
+                                    }
+                                }]
+                            },
+                            "finishReason": "STOP"
+                        }]
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut provider = test_provider(Some(GeminiAuth::ExplicitKey("test-key".into())));
+        provider.base_url = Some(format!("http://{}", addr));
+
+        let tools = vec![ToolSpec {
+            name: "get_weather".to_string(),
+            description: "Get weather".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"}
+                }
+            }),
+        }];
+
+        let messages = vec![
+            ChatMessage { role: "system".into(), content: "System prompt".into() },
+            ChatMessage { role: "user".into(), content: "What is the weather?".into() },
+        ];
+        let result = provider.chat_with_tools(&messages, &tools, "gemini-2.0-flash", 0.7).await;
+        
+        server_handle.abort();
+
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert!(response.tool_calls.iter().any(|tc| tc.name == "get_weather"));
+        
+        let req_body = captured.lock().unwrap().take().unwrap();
+        assert_eq!(req_body["contents"][0]["role"], "user");
+        assert!(req_body["tools"][0]["functionDeclarations"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_stream_chat_integration() {
+        let app = Router::new().route(
+            "/models/gemini-2.0-flash:streamGenerateContent",
+            post(|| async {
+                let stream = "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hello \"}]}}]}\n\ndata: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"world!\"}]}}]}\n\n";
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(stream))
+                    .unwrap()
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let messages = vec![ChatMessage { role: "user".into(), content: "Hi".into() }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let mut stream = provider.stream_chat(request, "gemini-2.0-flash", 0.7, StreamOptions::default());
+        let mut text = String::new();
+        use futures_util::StreamExt;
+        while let Some(event) = stream.next().await {
+            if let Ok(StreamEvent::TextDelta(delta)) = event {
+                text.push_str(&delta.delta);
+            }
+        }
+
+        server_handle.abort();
+        assert_eq!(text, "Hello world!");
+    }
+
+    #[tokio::test]
+    async fn test_error_handling_401() {
+        let app = Router::new().route(
+            "/models/gemini-2.0-flash:generateContent",
+            post(|| async {
+                (StatusCode::UNAUTHORIZED, "Unauthorized")
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut provider = test_provider(Some(GeminiAuth::ExplicitKey("wrong-key".into())));
+        provider.base_url = Some(format!("http://{}", addr));
+
+        let result = provider.chat_with_system(None, "Hi", "gemini-2.0-flash", 0.7).await;
+        
+        server_handle.abort();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("401"));
+    }
+
+    #[test]
     fn response_parses_usage_metadata() {
         let json = r#"{
             "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
@@ -2448,6 +2613,7 @@ mod tests {
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None, // Missing auth_service
             auth_profile_override: None,
+            base_url: None,
         };
 
         let result = provider.warmup().await;
@@ -2764,7 +2930,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_parsing_logic() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(10);
 
         // Simulation of SSE-like chunks
         let chunks = vec![
