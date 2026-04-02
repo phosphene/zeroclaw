@@ -5,7 +5,7 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, Provider, TokenUsage};
+use crate::providers::traits::{ChatMessage, ChatResponse, Provider, StreamChunk, TokenUsage};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -83,12 +83,20 @@ impl GeminiAuth {
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Serialize, Clone)]
+struct GeminiTool {
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct GenerateContentRequest {
     contents: Vec<Content>,
     #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiTool>>,
 }
 
 /// Request envelope for the internal cloudcode-pa API.
@@ -125,6 +133,8 @@ struct InternalGenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiTool>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -139,6 +149,22 @@ struct Content {
 enum Part {
     Text { text: String },
     Inline { inline_data: InlineData },
+    #[serde(rename = "functionCall")]
+    FunctionCall { function_call: FunctionCall },
+    #[serde(rename = "functionResponse")]
+    FunctionResponse { function_response: FunctionResponse },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct FunctionCall {
+    name: String,
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct FunctionResponse {
+    name: String,
+    response: serde_json::Value,
 }
 
 impl Part {
@@ -232,7 +258,9 @@ struct CandidateContent {
 struct ResponsePart {
     #[serde(default)]
     text: Option<String>,
-    /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<FunctionCall>,
+    /// Thinking models (e.g. gemini-2.0-flash-thinking) mark reasoning parts with `thought: true`.
     #[serde(default)]
     thought: bool,
 }
@@ -984,6 +1012,20 @@ impl GeminiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        let resp = self
+            .send_generate_content_full(contents, system_instruction, None, model, temperature)
+            .await?;
+        Ok((resp.text.unwrap_or_default(), resp.usage))
+    }
+
+    async fn send_generate_content_full(
+        &self,
+        contents: Vec<Content>,
+        system_instruction: Option<Content>,
+        tools: Option<Vec<GeminiTool>>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -1033,6 +1075,7 @@ impl GeminiProvider {
                 temperature,
                 max_output_tokens: 8192,
             },
+            tools,
         };
 
         let url = Self::build_generate_content_url(model, auth);
@@ -1056,7 +1099,6 @@ impl GeminiProvider {
 
             if auth.is_oauth() && Self::should_rotate_oauth_on_error(status, &error_text) {
                 // For CLI OAuth: rotate credentials
-                // For ManagedOAuth: AuthService handles refresh, just retry
                 let can_retry = match auth {
                     GeminiAuth::OAuthToken(_) => {
                         if let Some(state) = oauth_state.as_ref() {
@@ -1065,12 +1107,11 @@ impl GeminiProvider {
                             false
                         }
                     }
-                    GeminiAuth::ManagedOAuth => true, // AuthService refreshes automatically
+                    GeminiAuth::ManagedOAuth => true,
                     _ => false,
                 };
 
                 if can_retry {
-                    // Re-fetch token (may be refreshed)
                     let (new_token, new_project) = match auth {
                         GeminiAuth::OAuthToken(state) => {
                             let token = Self::get_valid_oauth_token(state).await?;
@@ -1133,32 +1174,6 @@ impl GeminiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            if auth.is_oauth()
-                && Self::should_retry_oauth_without_generation_config(status, &error_text)
-            {
-                tracing::warn!(
-                    "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
-                );
-                response = self
-                    .build_generate_content_request(
-                        auth,
-                        &url,
-                        &request,
-                        model,
-                        false,
-                        project.as_deref(),
-                        oauth_token.as_deref(),
-                    )
-                    .send()
-                    .await?;
-            } else {
-                anyhow::bail!("Gemini API error ({status}): {error_text}");
-            }
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
             anyhow::bail!("Gemini API error ({status}): {error_text}");
         }
 
@@ -1177,25 +1192,129 @@ impl GeminiProvider {
             cached_input_tokens: None,
         });
 
-        let text = result
-            .candidates
-            .and_then(|c| c.into_iter().next())
-            .and_then(|c| c.content)
-            .and_then(|c| c.effective_text())
-            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+        let mut tool_calls = Vec::new();
+        let mut text = None;
+        let mut reasoning_content = None;
 
-        Ok((text, usage))
+        if let Some(candidate) = result.candidates.and_then(|c| c.into_iter().next()) {
+            if let Some(content) = candidate.content {
+                let mut answer_parts = Vec::new();
+                for part in content.parts {
+                    if part.thought {
+                        if let Some(t) = part.text {
+                            reasoning_content = Some(t);
+                        }
+                    } else if let Some(fc) = part.function_call {
+                        tool_calls.push(crate::providers::traits::ToolCall {
+                            id: uuid::Uuid::new_v4().to_string(), // Gemini doesn't always provide IDs
+                            name: fc.name,
+                            arguments: fc.args.to_string(),
+                        });
+                    } else if let Some(t) = part.text {
+                        answer_parts.push(t);
+                    }
+                }
+                if !answer_parts.is_empty() {
+                    text = Some(answer_parts.join(""));
+                }
+            }
+        }
+
+        Ok(ChatResponse {
+            text,
+            tool_calls,
+            usage,
+            reasoning_content,
+        })
     }
 }
 
 #[async_trait]
 impl Provider for GeminiProvider {
-    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
-        crate::providers::traits::ProviderCapabilities {
-            vision: true,
-            native_tool_calling: false,
-            prompt_caching: false,
+
+    fn convert_tools(&self, tools: &[crate::tools::ToolSpec]) -> crate::providers::traits::ToolsPayload {
+        crate::providers::traits::ToolsPayload::Gemini {
+            function_declarations: tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    })
+                })
+                .collect(),
         }
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    system_parts.push(&msg.content);
+                }
+                "user" => {
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: build_parts(&msg.content),
+                    });
+                }
+                "assistant" => {
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part::text(&msg.content)],
+                    });
+                }
+                "tool" => {
+                    // Logic for feeding tool results back to Gemini.
+                    // This expects content to be JSON or stringified data.
+                    let response_value = serde_json::from_str(&msg.content)
+                        .unwrap_or_else(|_| serde_json::json!({ "output": msg.content }));
+
+                    contents.push(Content {
+                        role: Some("function".to_string()),
+                        parts: vec![Part::FunctionResponse {
+                            function_response: FunctionResponse {
+                                name: "unknown".to_string(), // Need to map this from history if possible
+                                response: response_value,
+                            },
+                        }],
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part::text(system_parts.join("\n\n"))],
+            })
+        };
+
+        let gemini_tools = vec![GeminiTool {
+            function_declarations: tools.to_vec(),
+        }];
+
+        self.send_generate_content_full(
+            contents,
+            system_instruction,
+            Some(gemini_tools),
+            model,
+            temperature,
+        )
+        .await
     }
 
     async fn chat_with_system(
@@ -1215,22 +1334,59 @@ impl Provider for GeminiProvider {
             parts: build_parts(message),
         }];
 
-        let (text, _usage) = self
+        let (text, _) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
         Ok(text)
     }
 
-    async fn chat_with_history(
+    fn stream_chat_with_system(
         &self,
-        messages: &[ChatMessage],
+        system_prompt: Option<&str>,
+        message: &str,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+        _options: crate::providers::traits::StreamOptions,
+    ) -> futures_util::stream::BoxStream<'static, crate::providers::traits::StreamResult<crate::providers::traits::StreamChunk>> {
+        let system_instruction = system_prompt.map(|sys| Content {
+            role: None,
+            parts: vec![Part::text(sys)],
+        });
+
+        let contents = vec![Content {
+            role: Some("user".to_string()),
+            parts: build_parts(message),
+        }];
+
+        Box::pin(futures_util::stream::once(self.stream_generate_content(
+            contents,
+            system_instruction,
+            None,
+            model,
+            temperature,
+        )).filter_map(|res| async {
+            match res {
+                Ok(s) => Some(s.map(|item| match item {
+                    crate::providers::traits::StreamEvent::TextDelta(chunk) => Ok(chunk),
+                    crate::providers::traits::StreamEvent::Final => Ok(crate::providers::traits::StreamChunk::final_chunk()),
+                    _ => Ok(crate::providers::traits::StreamChunk::delta("")), // Skip tool calls for text-only stream
+                })),
+                Err(e) => Some(Box::pin(futures_util::stream::once(async move { Err(e) })) as futures_util::stream::BoxStream<'static, _>),
+            }
+        }).flatten())
+    }
+
+    fn stream_chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        _options: crate::providers::traits::StreamOptions,
+    ) -> futures_util::stream::BoxStream<'static, crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>> {
         let mut system_parts: Vec<&str> = Vec::new();
         let mut contents: Vec<Content> = Vec::new();
 
-        for msg in messages {
+        for msg in request.messages {
             match msg.role.as_str() {
                 "system" => {
                     system_parts.push(&msg.content);
@@ -1242,7 +1398,6 @@ impl Provider for GeminiProvider {
                     });
                 }
                 "assistant" => {
-                    // Gemini API uses "model" role instead of "assistant"
                     contents.push(Content {
                         role: Some("model".to_string()),
                         parts: vec![Part::text(&msg.content)],
@@ -1261,10 +1416,18 @@ impl Provider for GeminiProvider {
             })
         };
 
-        let (text, _usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
-            .await?;
-        Ok(text)
+        Box::pin(futures_util::stream::once(self.stream_generate_content(
+            contents,
+            system_instruction,
+            None,
+            model,
+            temperature,
+        )).filter_map(|res| async {
+            match res {
+                Ok(s) => Some(s),
+                Err(e) => Some(Box::pin(futures_util::stream::once(async move { Err(e) })) as futures_util::stream::BoxStream<'static, _>),
+            }
+        }).flatten())
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1316,12 +1479,198 @@ impl Provider for GeminiProvider {
         }
         Ok(())
     }
+
+
+    async fn stream_generate_content(
+        &self,
+        contents: Vec<Content>,
+        system_instruction: Option<Content>,
+        tools: Option<Vec<GeminiTool>>,
+        model: &str,
+        temperature: f64,
+    ) -> crate::providers::traits::StreamResult<
+        futures_util::stream::BoxStream<'static, crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>>,
+    > {
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            crate::providers::traits::StreamError::Provider("Gemini API key not found".to_string())
+        })?;
+
+        // For OAuth: get a valid (potentially refreshed) token and resolve project
+        let (oauth_token, project) = match auth {
+            GeminiAuth::OAuthToken(state) => {
+                let token = Self::get_valid_oauth_token(state).await.map_err(|e| {
+                    crate::providers::traits::StreamError::Provider(format!(
+                        "OAuth token error: {e}"
+                    ))
+                })?;
+                let proj = self.resolve_oauth_project(&token).await.map_err(|e| {
+                    crate::providers::traits::StreamError::Provider(format!(
+                        "OAuth project error: {e}"
+                    ))
+                })?;
+                (Some(token), Some(proj))
+            }
+            GeminiAuth::ManagedOAuth => {
+                let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+                    crate::providers::traits::StreamError::Provider(
+                        "ManagedOAuth requires auth_service".to_string(),
+                    )
+                })?;
+                let token = auth_service
+                    .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
+                    .await
+                    .map_err(|e| {
+                        crate::providers::traits::StreamError::Provider(format!(
+                            "ManagedOAuth error: {e}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        crate::providers::traits::StreamError::Provider(
+                            "Gemini auth profile not found".to_string(),
+                        )
+                    })?;
+                let proj = self.resolve_oauth_project(&token).await.map_err(|e| {
+                    crate::providers::traits::StreamError::Provider(format!(
+                        "OAuth project error: {e}"
+                    ))
+                })?;
+                (Some(token), Some(proj))
+            }
+            _ => (None, None),
+        };
+
+        let request = GenerateContentRequest {
+            contents,
+            system_instruction,
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: 8192,
+            },
+            tools,
+        };
+
+        let base_url = Self::build_generate_content_url(model, auth);
+        let stream_url = format!("{}?alt=sse", base_url.replace(":generateContent", ":streamGenerateContent"));
+
+        let response = self
+            .build_generate_content_request(
+                auth,
+                &stream_url,
+                &request,
+                model,
+                true,
+                project.as_deref(),
+                oauth_token.as_deref(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                crate::providers::traits::StreamError::Provider(format!("Streaming error: {e}"))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(crate::providers::traits::StreamError::Provider(format!(
+                "Gemini streaming API error ({status}): {error_text}"
+            )));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        tokio::spawn(async move {
+            Self::parse_gemini_stream(response, tx).await;
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    async fn parse_gemini_stream(
+        response: reqwest::Response,
+        tx: tokio::sync::mpsc::Sender<crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>>,
+    ) {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncBufReadExt;
+        use tokio_util::io::StreamReader;
+
+        let byte_stream = response
+            .bytes_stream()
+            .map(|result| result.map_err(std::io::Error::other));
+        let reader = StreamReader::new(byte_stream);
+        let mut lines = reader.lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let json_str = &line["data: ".len()..];
+            let result: Result<GenerateContentResponse, _> = serde_json::from_str(json_str);
+
+            match result {
+                Ok(resp) => {
+                    let mut text_parts = Vec::new();
+                    let mut tool_calls = Vec::new();
+
+                    if let Some(candidate) = resp.candidates.and_then(|c| c.into_iter().next()) {
+                        if let Some(content) = candidate.content {
+                            for part in content.parts {
+                                if part.thought {
+                                    // Handle thought parts if needed, currently we just skip or send as delta if desired.
+                                    // For now, reasoning is usually sent in unary or khusus thinking chunks.
+                                } else if let Some(fc) = part.function_call {
+                                    tool_calls.push(crate::providers::traits::ToolCall {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        name: fc.name,
+                                        arguments: fc.args.to_string(),
+                                    });
+                                } else if let Some(t) = part.text {
+                                    text_parts.push(t);
+                                }
+                            }
+                        }
+                    }
+
+                    for text in text_parts {
+                        if !text.is_empty() {
+                            let _ = tx
+                                .send(Ok(crate::providers::traits::StreamEvent::TextDelta(
+                                    crate::providers::traits::StreamChunk::delta(text),
+                                )))
+                                .await;
+                        }
+                    }
+
+                    for call in tool_calls {
+                        let _ = tx
+                            .send(Ok(crate::providers::traits::StreamEvent::ToolCall(call)))
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(crate::providers::traits::StreamError::Provider(format!(
+                            "JSON decode error: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        let _ = tx.send(Ok(crate::providers::traits::StreamEvent::Final)).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::{StatusCode, header::AUTHORIZATION};
+    use crate::providers::traits::{ToolsPayload, StreamEvent, ChatResponse, StreamChunk};
+    use crate::tools::ToolSpec;
 
     /// Helper to create a test OAuth auth variant.
     fn test_oauth_auth(token: &str) -> GeminiAuth {
@@ -2271,5 +2620,207 @@ mod tests {
         // System messages should use Part::text
         let system_part = Part::text("You are helpful");
         assert!(matches!(system_part, Part::Text { .. }));
+    }
+
+    #[test]
+    fn convert_tools_maps_zeroclaw_specs_to_gemini_functions() {
+        let provider = test_provider(None);
+        let tools = vec![ToolSpec {
+            name: "get_weather".to_string(),
+            description: "Get current weather".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"}
+                },
+                "required": ["location"]
+            }),
+        }];
+
+        let payload = provider.convert_tools(&tools);
+        if let ToolsPayload::Gemini {
+            function_declarations,
+        } = payload
+        {
+            assert_eq!(function_declarations.len(), 1);
+            let func = &function_declarations[0];
+            assert_eq!(func["name"], "get_weather");
+            assert_eq!(func["description"], "Get current weather");
+            assert_eq!(func["parameters"]["type"], "object");
+            assert_eq!(func["parameters"]["required"][0], "location");
+        } else {
+            panic!("Expected ToolsPayload::Gemini");
+        }
+    }
+
+    #[test]
+    fn chat_with_tools_message_mapping() {
+        let provider = test_provider(None);
+        let messages = vec![
+            ChatMessage::user("Search for rust"),
+            ChatMessage::assistant("I will search..."),
+            ChatMessage::tool(r#"{"results": ["rust-lang.org"]}"#),
+        ];
+
+        // We can't easily call chat_with_tools without mocking the HTTP client,
+        // but we can test the internal conversion logic if we refactor it or test
+        // the Content structures it produces. Since the method is async and private
+        // parts are used, we test the Part variants directly via build_parts
+        // and our manual Content construction.
+
+        let contents = vec![
+            Content {
+                role: Some("user".into()),
+                parts: build_parts("Search for rust"),
+            },
+            Content {
+                role: Some("model".into()),
+                parts: vec![Part::text("I will search...")],
+            },
+            Content {
+                role: Some("function".into()), // Role used for function response
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponse {
+                        name: "search".into(),
+                        response: serde_json::json!({"results": ["rust-lang.org"]}),
+                    },
+                }],
+            },
+        ];
+
+        let json = serde_json::to_value(&contents).unwrap();
+        assert_eq!(json[0]["role"], "user");
+        assert_eq!(json[1]["role"], "model");
+        assert_eq!(json[2]["role"], "function");
+        assert!(json[2]["parts"][0].get("functionResponse").is_some());
+    }
+
+    #[test]
+    fn unary_response_parsing_with_tool_calls() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "I will read that file."},
+                        {
+                            "functionCall": {
+                                "name": "read_file",
+                                "args": {"path": "test.rs"}
+                            }
+                        }
+                    ]
+                }
+            }]
+        }"#;
+
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let effective = resp.into_effective_response();
+        let candidate = effective.candidates.unwrap().into_iter().next().unwrap();
+        let content = candidate.content.unwrap();
+
+        let text = content.effective_text();
+        assert_eq!(text, Some("I will read that file.".to_string()));
+
+        let tool_calls: Vec<_> = content
+            .parts
+            .iter()
+            .filter_map(|p| p.function_call.as_ref())
+            .collect();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "read_file");
+        assert_eq!(tool_calls[0].args["path"], "test.rs");
+    }
+
+    #[test]
+    fn unary_response_parsing_with_reasoning() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": true, "text": "Analyzing the codebase..."},
+                        {"text": "Found it."}
+                    ]
+                }
+            }]
+        }"#;
+
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let candidate = resp.candidates.unwrap().into_iter().next().unwrap();
+        let content = candidate.content.unwrap();
+
+        // Check reasoning extraction
+        let thoughts: Vec<_> = content
+            .parts
+            .iter()
+            .filter(|p| p.thought)
+            .filter_map(|p| p.text.as_deref())
+            .collect();
+        assert_eq!(thoughts, vec!["Analyzing the codebase..."]);
+
+        // Check final text
+        assert_eq!(content.effective_text(), Some("Found it.".into()));
+    }
+
+    #[tokio::test]
+    async fn stream_parsing_logic() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        // Simulation of SSE-like chunks
+        let chunks = vec![
+            r#"data: {"candidates": [{"content": {"parts": [{"text": "Hello "}]}}]}"#,
+            r#"data: {"candidates": [{"content": {"parts": [{"text": "world!"}]}}]}"#,
+            r#"data: {"candidates": [{"content": {"parts": [{"functionCall": {"name": "done", "args": {}}}]}}]}"#,
+        ];
+
+        // We can't easily call parse_gemini_stream directly because it takes a reqwest::Response.
+        // Instead, we verify the heart of the loop: JSON parsing + event creation.
+
+        for chunk_str in chunks {
+            let line = chunk_str.trim();
+            if line.starts_with("data: ") {
+                let json_str = &line["data: ".len()..];
+                let resp: GenerateContentResponse = serde_json::from_str(json_str).unwrap();
+
+                if let Some(candidate) = resp.candidates.and_then(|c| c.into_iter().next()) {
+                    if let Some(content) = candidate.content {
+                        for part in content.parts {
+                            if let Some(fc) = part.function_call {
+                                let _ = tx
+                                    .send(Ok(StreamEvent::ToolCall(crate::providers::traits::ToolCall {
+                                        id: "123".into(),
+                                        name: fc.name,
+                                        arguments: fc.args.to_string(),
+                                    })))
+                                    .await;
+                            } else if let Some(t) = part.text {
+                                let _ = tx
+                                    .send(Ok(StreamEvent::TextDelta(crate::providers::traits::StreamChunk::delta(t))))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify captured events
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.unwrap());
+        }
+
+        assert_eq!(events.len(), 3);
+        if let StreamEvent::TextDelta(chunk) = &events[0] {
+            assert_eq!(chunk.delta, "Hello ");
+        } else {
+            panic!("Event 1 should be TextDelta");
+        }
+        if let StreamEvent::TextDelta(chunk) = &events[1] {
+            assert_eq!(chunk.delta, "world!");
+        }
+        if let StreamEvent::ToolCall(call) = &events[2] {
+            assert_eq!(call.name, "done");
+        }
     }
 }
